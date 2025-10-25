@@ -1,58 +1,45 @@
-import time
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
-
-st.set_page_config(page_title="Binance LOB Monitor", layout="wide")
-st.title("📈 Binance 即時行情 / 訂單簿")
-
-# 每 1000ms 重新執行一次整個 app
-st_autorefresh(interval=1000, key="auto-refresh")
-
+from binance.spot import Spot
+import pandas as pd
 from collections import deque, defaultdict
 from datetime import datetime
 
-import pandas as pd
-import streamlit as st
-from binance.spot import Spot
-
 # -----------------------------
-# 基本設定
+# 自動刷新（每秒）
 # -----------------------------
 st.set_page_config(page_title="Binance LOB Monitor", layout="wide")
-
-# 自動刷新：每 1000ms 重新執行一次 app
-try:
-    st.autorefresh(interval=1000, key="auto-refresh")
-except Exception:
-    pass
-
-# 初始化 Binance 客戶端（只讀公開資料，不需要 API Key）
-client = Spot(base_url="https://testnet.binance.vision")
+st.title("📈 Binance 即時行情 / 訂單簿（每秒更新、上漲綠/下跌紅）")
+st_autorefresh(interval=1000, key="auto-refresh")
 
 # -----------------------------
-# 側邊欄控制
+# 側邊欄設定
 # -----------------------------
 with st.sidebar:
     st.header("⚙️ 設定")
-    default_symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "BTCUSD", "ETHUSD", "BTCEUR", "ETHEUR"]
-    symbols = st.multiselect(
-        "選擇交易對（可多選）",
-        options=default_symbols,
-        default=["BTCUSDT", "ETHUSDT"],
-        help="可輸入其他現貨交易對（例如：SOLUSDT、XRPUSDT…）"
-    )
+    # ⚠️ 在雲端預設 Testnet，避免 451
+    use_testnet = st.toggle("使用 Testnet（建議雲端開啟）", value=True,
+                            help="雲端伺服器常被主網地區限制；Testnet 不會 451")
+    default_symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+    symbols = st.multiselect("選擇交易對（可多選）", options=default_symbols,
+                             default=["BTCUSDT", "ETHUSDT"])
     depth_limit = st.selectbox("訂單簿階數（雙邊）", [5, 10, 20, 50, 100], index=2)
     history_len = st.slider("走勢保存點數（每秒一點）", min_value=30, max_value=600, value=180, step=30)
-    st.caption("此頁面每秒自動刷新；若不想刷新，可暫停瀏覽器的自動重新整理外掛。")
 
-# 歷史價 + 上次數值（用於判斷漲跌）
+base_url = "https://testnet.binance.vision" if use_testnet else "https://api.binance.com"
+st.caption(f"目前 API：{base_url}")
+
+# -----------------------------
+# 建立 Binance Client（只讀，不需要 key）
+# -----------------------------
+client = Spot(base_url=base_url)
+
+# 狀態保存
 if "history" not in st.session_state:
     st.session_state.history = defaultdict(lambda: deque(maxlen=history_len))
 if "last_vals" not in st.session_state:
-    # last_vals[sym] = {"price": float|None, "mid":..., "bid":..., "ask":...}
     st.session_state.last_vals = defaultdict(lambda: {"price": None, "mid": None, "bid": None, "ask": None})
-
-# 若使用者修改了 history_len，更新 deque 的 maxlen
+# 如果改了 history_len，要同步 deque 的長度
 for sym, dq in list(st.session_state.history.items()):
     if dq.maxlen != history_len:
         st.session_state.history[sym] = deque(dq, maxlen=history_len)
@@ -62,155 +49,119 @@ if not symbols:
     st.stop()
 
 # -----------------------------
-# 工具：著色 + 箭頭
+# 取數據（含清楚的錯誤訊息）
 # -----------------------------
-def colored_arrow(curr: float, prev: float | None):
+def fetch_ticker(symbol: str):
+    return float(client.ticker_price(symbol)["price"])
+
+def fetch_depth_best(symbol: str, limit: int):
+    ob = client.depth(symbol, limit=limit)
+    bids = ob.get("bids") or []
+    asks = ob.get("asks") or []
+    if not bids or not asks:
+        return None
+    bbp, bbs = float(bids[0][0]), float(bids[0][1])
+    bap, bas = float(asks[0][0]), float(asks[0][1])
+    spread = bap - bbp
+    mid = (bap + bbp) / 2
+    rel_bps = (spread / mid) * 10_000 if mid else 0.0
+    return {
+        "best_bid_price": bbp, "best_bid_size": bbs,
+        "best_ask_price": bap, "best_ask_size": bas,
+        "spread": spread, "mid": mid, "rel_spread_bps": rel_bps,
+        "bids": bids, "asks": asks
+    }
+
+# 著色工具
+def arrow_and_color(curr, prev):
     if prev is None:
-        return "", ""
+        return "", "#BBB"
     if curr > prev:
         return "▲", "green"
     if curr < prev:
         return "▼", "red"
     return "→", "#888"
 
-def color_text(label: str, value: float, prev: float | None, fmt: str = ",.2f"):
-    arrow, color = colored_arrow(value, prev)
-    val_str = format(value, fmt)
-    if prev is None:
-        return f"{label}：{val_str}"
-    return f"""<span>{label}：</span>
-               <span style="color:{color}; font-weight:700;">{val_str} {arrow}</span>"""
-
-# -----------------------------
-# 取資料的函式
-# -----------------------------
-def fetch_ticker(symbol: str):
-    data = client.ticker_price(symbol)
-    return float(data["price"])
-
-def fetch_depth_best(symbol: str, limit: int):
-    ob = client.depth(symbol, limit=limit)
-    bids = ob.get("bids", [])
-    asks = ob.get("asks", [])
-    if not bids or not asks:
-        return None
-
-    best_bid_price = float(bids[0][0])
-    best_bid_size  = float(bids[0][1])
-    best_ask_price = float(asks[0][0])
-    best_ask_size  = float(asks[0][1])
-    spread = best_ask_price - best_bid_price
-    mid = (best_ask_price + best_bid_price) / 2
-    rel_spread_bps = (spread / mid) * 10_000 if mid else 0.0
-
-    return {
-        "best_bid_price": best_bid_price,
-        "best_bid_size": best_bid_size,
-        "best_ask_price": best_ask_price,
-        "best_ask_size": best_ask_size,
-        "spread": spread,
-        "mid": mid,
-        "rel_spread_bps": rel_spread_bps,
-        "bids": bids,
-        "asks": asks,
-    }
-
-# -----------------------------
-# 主內容
-# -----------------------------
 now = datetime.now()
 st.caption(f"最後更新時間：{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 for sym in symbols:
     with st.container():
-        cols = st.columns([1.2, 1.4, 1.4])  # 左：指標卡；中：走勢；右：深度表
+        cols = st.columns([1.2, 1.4, 1.4])
 
-        # 取資料
+        # 嘗試抓數據；如果 451 / 403 等，顯示清楚的錯誤
         try:
-            ticker_price = fetch_ticker(sym)
-            depth_info = fetch_depth_best(sym, depth_limit)
+            price = fetch_ticker(sym)
+            depth = fetch_depth_best(sym, depth_limit)
         except Exception as e:
-            st.error(f"{sym} 取數據失敗：{e}")
+            st.error(f"{sym} 取數據失敗：{e}\n(目前 base_url={base_url})")
+            st.markdown("➡️ 如果你在雲端且看到 451/403，保持 **使用 Testnet** 開啟即可。")
+            st.markdown("➡️ 若仍失敗，試試改用其他部署平台或改回本機 + Cloudflare tunnel。")
+            st.markdown("---")
             continue
 
-        if not depth_info:
-            st.warning(f"{sym} 沒有取得到訂單簿資料。")
+        if not depth:
+            st.warning(f"{sym} 沒有取得到訂單簿資料。（base_url={base_url}）")
+            st.markdown("---")
             continue
 
-        # 讀前值
+        # 讀前值 / 更新歷史
         last = st.session_state.last_vals[sym]
-        prev_price = last["price"]
-        prev_mid   = last["mid"]
-        prev_bid   = last["bid"]
-        prev_ask   = last["ask"]
+        prev_price, prev_mid = last["price"], last["mid"]
+        prev_bid, prev_ask = last["bid"], last["ask"]
 
-        # 更新歷史 & 前值
         st.session_state.history[sym].append({
-            "ts": now,
-            "price": ticker_price,
-            "mid": depth_info["mid"],
-            "bid": depth_info["best_bid_price"],
-            "ask": depth_info["best_ask_price"],
+            "ts": now, "price": price, "mid": depth["mid"],
+            "bid": depth["best_bid_price"], "ask": depth["best_ask_price"]
         })
-        last["price"] = ticker_price
-        last["mid"]   = depth_info["mid"]
-        last["bid"]   = depth_info["best_bid_price"]
-        last["ask"]   = depth_info["best_ask_price"]
+        last.update({"price": price, "mid": depth["mid"],
+                     "bid": depth["best_bid_price"], "ask": depth["best_ask_price"]})
 
-        # ---------- 左：重點指標（含紅綠箭頭） ----------
+        # 左側 KPI（含漲綠跌紅）
         with cols[0]:
             st.subheader(sym)
+            delta_p = None if prev_price is None else price - prev_price
+            st.metric("最新價", f"{price:,.2f}", None if delta_p is None else f"{delta_p:+.2f}")
 
-            # 1) 最新價（使用 metric 顯示 delta，自動紅綠）
-            delta_price = None if prev_price is None else ticker_price - prev_price
-            st.metric("最新價", f"{ticker_price:,.2f}",
-                      delta=None if delta_price is None else f"{delta_price:+.2f}")
+            delta_m = None if prev_mid is None else depth["mid"] - prev_mid
+            st.metric("Mid", f"{depth['mid']:,.2f}", None if delta_m is None else f"{delta_m:+.2f}")
 
-            # 2) Mid（metric + 紅綠箭頭）
-            delta_mid = None if prev_mid is None else depth_info["mid"] - prev_mid
-            st.metric("Mid", f"{depth_info['mid']:,.2f}",
-                      delta=None if delta_mid is None else f"{delta_mid:+.2f}")
+            k1, k2 = st.columns(2)
+            k1.metric("Spread", f"{depth['spread']:,.4f}")
+            k2.metric("相對價差", f"{depth['rel_spread_bps']:,.1f} bps")
 
-            # 3) Spread & 相對價差
-            kpi3, kpi4 = st.columns(2)
-            kpi3.metric("Spread", f"{depth_info['spread']:,.4f}")
-            kpi4.metric("相對價差", f"{depth_info['rel_spread_bps']:,.1f} bps")
+            # Bid / Ask 顏色
+            arw, col = arrow_and_color(depth["best_bid_price"], prev_bid)
+            st.markdown(f"<b>最佳買一：</b> <span style='color:{col}'>{depth['best_bid_price']:,.2f} {arw}</span><br/>"
+                        f"數量：{depth['best_bid_size']}", unsafe_allow_html=True)
+            arw, col = arrow_and_color(depth["best_ask_price"], prev_ask)
+            st.markdown(f"<b>最佳賣一：</b> <span style='color:{col}'>{depth['best_ask_price']:,.2f} {arw}</span><br/>"
+                        f"數量：{depth['best_ask_size']}", unsafe_allow_html=True)
 
-            # 4) Bid/Ask 文字行加紅綠箭頭
-            bid_html = color_text("最佳買一",
-                                  depth_info["best_bid_price"], prev_bid, fmt=",.2f")
-            ask_html = color_text("最佳賣一",
-                                  depth_info["best_ask_price"], prev_ask, fmt=",.2f")
-            st.markdown(bid_html, unsafe_allow_html=True)
-            st.write(f"數量：{depth_info['best_bid_size']}")
-            st.markdown(ask_html, unsafe_allow_html=True)
-            st.write(f"數量：{depth_info['best_ask_size']}")
-
-        # ---------- 中：走勢（每秒一點，畫 mid） ----------
+        # 中：走勢（mid）
         with cols[1]:
             st.markdown("**價格走勢（mid）**")
-            hist_df = pd.DataFrame(st.session_state.history[sym])
-            if not hist_df.empty:
-                hist_df = hist_df.set_index("ts")
-                # 你也可改成多線：hist_df[["mid","bid","ask"]]
-                st.line_chart(hist_df[["mid"]])
+            df = pd.DataFrame(st.session_state.history[sym])
+            if not df.empty:
+                df = df.set_index("ts")
+                st.line_chart(df[["mid"]])
             else:
                 st.info("等待累積資料…")
 
-        # ---------- 右：深度（前 N 檔） ----------
+        # 右：深度表
         with cols[2]:
             st.markdown(f"**訂單簿前 {depth_limit} 檔**")
-            bids_df = pd.DataFrame(depth_info["bids"], columns=["Bid Price", "Bid Size"]).astype(float)
-            asks_df = pd.DataFrame(depth_info["asks"], columns=["Ask Price", "Ask Size"]).astype(float)
+            bids_df = pd.DataFrame(depth["bids"], columns=["Bid Price", "Bid Size"]).astype(float)
+            asks_df = pd.DataFrame(depth["asks"], columns=["Ask Price", "Ask Size"]).astype(float)
             bids_df = bids_df.sort_values("Bid Price", ascending=False).head(depth_limit)
             asks_df = asks_df.sort_values("Ask Price", ascending=True).head(depth_limit)
 
             c1, c2 = st.columns(2)
             with c1:
                 st.caption("Bids")
-                st.dataframe(bids_df, height=280, use_container_width=True)
+                st.dataframe(bids_df, height=260, use_container_width=True)
             with c2:
                 st.caption("Asks")
-                st.dataframe(asks_df, height=280, use_container_width=True)
+                st.dataframe(asks_df, height=260, use_container_width=True)
 
         st.markdown("---")
