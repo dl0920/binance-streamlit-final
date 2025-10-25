@@ -27,7 +27,7 @@ except Exception:
     pass
 
 # 初始化 Binance 客戶端（只讀公開資料，不需要 API Key）
-client = Spot()
+client = Spot(base_url="https://testnet.binance.vision")
 
 # -----------------------------
 # 側邊欄控制
